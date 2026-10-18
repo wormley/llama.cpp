@@ -49,7 +49,7 @@ RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
         && export SYCL_PROGRAM_COMPILE_OPTIONS="-cl-fp32-correctly-rounded-divide-sqrt"; \
     fi && \
     echo "Building with dynamic libs" && \
-    cmake -B build -DGGML_NATIVE=OFF -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${OPT_SYCL_F16} && \
+    cmake -B build -DGGML_NATIVE=OFF -DGGML_SYCL=ON -DGGML_SYCL_DNN=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${OPT_SYCL_F16} && \
     cmake --build build --config Release -j$((($(nproc)+1)/2))
 
 RUN mkdir -p /app/lib && \
@@ -160,6 +160,8 @@ ENV LLAMA_ARG_PORT=8080
 
 COPY --from=build /app/lib/ /app
 COPY --from=build /app/full/llama /app/full/llama-server /app/
+# preserve the build recipe inside the image for future reference
+COPY .devops/intel.Dockerfile /app/
 
 WORKDIR /app
 

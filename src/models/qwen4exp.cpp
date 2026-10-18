@@ -569,7 +569,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
     llm_graph_input_kpool * inp_kpool = nullptr;
-    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0) {
+    // the MTP block itself is dense attention, so it needs the k-pool inputs only when its
+    // compress ratio marks it as a QSA layer; otherwise no node in this graph reads them
+    // (upstream issue #29811: writing the unused pool input aborts on a null buffer)
+    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0 && hparams.dsv4_compress_ratios[il] > 0) {
         GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
                 "the indexer cache must track the attention cache cell for cell");
         inp_kpool = build_inp_kpool(mctx_hyb);

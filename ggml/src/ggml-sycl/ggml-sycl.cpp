@@ -106,6 +106,7 @@ int g_ggml_sycl_mmvq_wide = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_xmx_gather_types = GGML_SYCL_XMX_GATHER_TYPES_DEFAULT;
 int g_ggml_sycl_xmx_gather_shapes = GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT;
+int g_ggml_sycl_grouped_max_rows = 64;
 int g_ggml_sycl_dynamic_precision = GGML_SYCL_DYNAMIC_PRECISION_DEFAULT;
 int g_ggml_sycl_dynamic_required_precision = GGML_SYCL_DYNAMIC_PRECISION_F32;
 static const char * ggml_sycl_dynamic_precision_names[] = { "F16", "BF16", "TF32", "F32" };
@@ -427,6 +428,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
         g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
         g_ggml_sycl_xmx_gather_shapes = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_SHAPES", GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT);
+        g_ggml_sycl_grouped_max_rows = ggml_sycl_get_env("GGML_SYCL_GROUPED_MAX_ROWS", 64);
         g_ggml_sycl_dynamic_precision =
             ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_DEFAULT);
         g_ggml_sycl_dynamic_required_precision =
@@ -5773,7 +5775,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         }
 
         bool grouped = false;
-        if (ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
+        // The grouped dequant-GEMM wins small routed batches (decode / MTP verify:
+        // one launch instead of one per expert) but loses to the per-expert library
+        // GEMM at prefill sizes on B70 (measured: pB 228 vs 126 tok/s with 512-token
+        // ubatches of a Q8_0-expert MoE). Gate it on the routed-row count; tune with
+        // GGML_SYCL_GROUPED_MAX_ROWS (0 disables the grouped path entirely).
+        if (n_routed_rows <= g_ggml_sycl_grouped_max_rows &&
+            ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
             dst->type == GGML_TYPE_F32 && nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0) {
             // the grouped GEMM reads the reorder (SoA) layout faster, and the first decode step installs it
             // anyway: install it here already, so prefill does not depend on whether a decode ran before

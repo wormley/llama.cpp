@@ -5774,31 +5774,24 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             });
         }
 
-        // Reorder install stays UNGATED (one-time cost, paid once per tensor): the
-        // grouped GEMM and the per-expert fallback both read the SoA layout faster,
-        // and decode should never pay the install mid-generation.
-        if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
-            ggml_sycl_xmx_gather_type_enabled(src0->type)) {
-            opt_for_reorder_id(&ctx, src0);
-        }
-
-        // one-shot diagnostic: what do real MUL_MAT_ID batch sizes look like?
-        static int grouped_log_left = 8;
-        if (grouped_log_left-- > 0) {
-            GGML_LOG_INFO("%s: MUL_MAT_ID n_routed_rows=%lld n_as=%lld grouped_max=%d\n",
-                          __func__, (long long) n_routed_rows, (long long) n_as,
-                          g_ggml_sycl_grouped_max_rows);
-        }
-
         bool grouped = false;
         // The grouped dequant-GEMM wins small routed batches (decode / MTP verify:
         // one launch instead of one per expert) but loses to the per-expert library
         // GEMM at prefill sizes on B70 (measured: pB 228 vs 126 tok/s with 512-token
         // ubatches of a Q8_0-expert MoE). Gate it on the routed-row count; tune with
         // GGML_SYCL_GROUPED_MAX_ROWS (0 disables the grouped path entirely).
+        // NOTE: the reorder install MUST stay inside this gate — the SoA layout is
+        // slower for the library GEMM fallback (measured pB 113 with install +
+        // library vs 228 canonical), so installing unconditionally poisons prefill.
         if (n_routed_rows <= g_ggml_sycl_grouped_max_rows &&
             ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
             dst->type == GGML_TYPE_F32 && nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0) {
+            // the grouped GEMM reads the reorder (SoA) layout faster; install it on
+            // first use so decode pays the cost once, outside steady-state
+            if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
+                ggml_sycl_xmx_gather_type_enabled(src0->type)) {
+                opt_for_reorder_id(&ctx, src0);
+            }
             const bool src0_reordered =
                 src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
             grouped = ggml_sycl_grouped_dequant_gemm(src0->type, src0_reordered, src0_original, nb02,

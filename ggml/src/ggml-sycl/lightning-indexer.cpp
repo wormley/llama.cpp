@@ -38,6 +38,21 @@ static void lightning_indexer_f32_sycl(
             const int64_t i_batch  = i_bs / n_stream;
             const int64_t i_stream = i_bs % n_stream;
 
+            // QSA pool skip: a pool the pool_mask drops contributes exactly -inf
+            // to the output (finite score + (-inf) mask == -inf), so the K-row read
+            // and the head dot products can be skipped and -inf written directly.
+            // Bitwise identical to computing score + (-inf). Uniform per subgroup:
+            // each 16-lane subgroup covers exactly one row, so the early return
+            // never splits a subgroup across the reduce_over_group below.
+            const float m_skip = static_cast<float>(
+                    ((const sycl::half *)(m + i_batch*nbm1 + (i_stream % nem3)*nbm3))[i_kv]);
+            if (m_skip == -INFINITY) {
+                // flat-index store, same rationale as the store at the end
+                const int64_t dst_idx = i_kv + i_batch*(nb1/sizeof(float)) + i_stream*(nb3/sizeof(float));
+                dst[dst_idx] = -INFINITY;
+                return;
+            }
+
             // load K row slice into registers (row is contiguous, nbk0 == type size)
             const char * k_base = k + i_kv*nbk2 + i_stream*nbk3;
             float k_local[ELEMS_PER_LANE];

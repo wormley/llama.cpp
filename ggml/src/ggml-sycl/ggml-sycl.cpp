@@ -106,7 +106,7 @@ int g_ggml_sycl_mmvq_wide = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_xmx_gather_types = GGML_SYCL_XMX_GATHER_TYPES_DEFAULT;
 int g_ggml_sycl_xmx_gather_shapes = GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT;
-int g_ggml_sycl_grouped_max_rows = 64;
+int g_ggml_sycl_grouped_max_rows = 512;
 int g_ggml_sycl_dynamic_precision = GGML_SYCL_DYNAMIC_PRECISION_DEFAULT;
 int g_ggml_sycl_dynamic_required_precision = GGML_SYCL_DYNAMIC_PRECISION_F32;
 static const char * ggml_sycl_dynamic_precision_names[] = { "F16", "BF16", "TF32", "F32" };
@@ -428,7 +428,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
         g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
         g_ggml_sycl_xmx_gather_shapes = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_SHAPES", GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT);
-        g_ggml_sycl_grouped_max_rows = ggml_sycl_get_env("GGML_SYCL_GROUPED_MAX_ROWS", 64);
+        g_ggml_sycl_grouped_max_rows = ggml_sycl_get_env("GGML_SYCL_GROUPED_MAX_ROWS", 512);
         g_ggml_sycl_dynamic_precision =
             ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_DEFAULT);
         g_ggml_sycl_dynamic_required_precision =
@@ -5774,6 +5774,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             });
         }
 
+        // Reorder install stays UNGATED (one-time cost, paid once per tensor): the
+        // grouped GEMM and the per-expert fallback both read the SoA layout faster,
+        // and decode should never pay the install mid-generation.
+        if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
+            ggml_sycl_xmx_gather_type_enabled(src0->type)) {
+            opt_for_reorder_id(&ctx, src0);
+        }
+
+        // one-shot diagnostic: what do real MUL_MAT_ID batch sizes look like?
+        static int grouped_log_left = 8;
+        if (grouped_log_left-- > 0) {
+            GGML_LOG_INFO("%s: MUL_MAT_ID n_routed_rows=%lld n_as=%lld grouped_max=%d\n",
+                          __func__, (long long) n_routed_rows, (long long) n_as,
+                          g_ggml_sycl_grouped_max_rows);
+        }
+
         bool grouped = false;
         // The grouped dequant-GEMM wins small routed batches (decode / MTP verify:
         // one launch instead of one per expert) but loses to the per-expert library
@@ -5783,12 +5799,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         if (n_routed_rows <= g_ggml_sycl_grouped_max_rows &&
             ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
             dst->type == GGML_TYPE_F32 && nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0) {
-            // the grouped GEMM reads the reorder (SoA) layout faster, and the first decode step installs it
-            // anyway: install it here already, so prefill does not depend on whether a decode ran before
-            if (g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
-                ggml_sycl_xmx_gather_type_enabled(src0->type)) {
-                opt_for_reorder_id(&ctx, src0);
-            }
             const bool src0_reordered =
                 src0->extra && ((const ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder;
             grouped = ggml_sycl_grouped_dequant_gemm(src0->type, src0_reordered, src0_original, nb02,

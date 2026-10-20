@@ -6626,6 +6626,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        // scale_out*sigmoid(scale_in*post) as the hc_post weights (qwen4exp hc_combine); port of the
+        // CUDA/Vulkan hc_post_gate fusion. The two SCALE nodes and the SIGMOID are elided; the
+        // hc_post kernel applies the gate to the raw weights itself.
+        if (node->op == GGML_OP_SCALE &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST },
+                               { GGML_UNARY_OP_SIGMOID })) {
+            ggml_sycl_op_dsv4_hc_post(*sycl_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
+            i += 3;
+            continue;
+        }
+
         // Batch consecutive independent same-shape F32 L2_NORM siblings (the GDN q/k
         // norms) into one launch; sources are strided views of the fused qkv buffer, so
         // the scan skips the interleaved view nodes instead of breaking on them.

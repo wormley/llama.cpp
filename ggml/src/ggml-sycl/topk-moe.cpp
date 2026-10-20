@@ -5,6 +5,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "fusion.hpp"
 #include "topk-moe.hpp"
 
 // SYCL port of ggml-cuda/topk-moe.cu. The kernel is a translation of the CUDA no-bias, no-PDL
@@ -477,66 +478,6 @@ static bool ggml_sycl_topk_moe_fusion(const ggml_cgraph * cgraph, int node_idx, 
     }
 
     return true;
-}
-
-// returns whether the write (out) nodes overwrite the read nodes in operation
-// ported from ggml_cuda_check_fusion_memory_ranges - pure pointer/range inspection
-static bool ggml_sycl_check_fusion_memory_ranges(const ggml_cgraph * cgraph, const int node_idx,
-                                                 const int node_count, const int * out_nodes, const int out_count,
-                                                 const bool is_topk_moe = false) {
-    auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
-        const int64_t a_start = (int64_t) a->data;
-        const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
-
-        const int64_t b_start = (int64_t) b->data;
-        const int64_t b_end   = b_start + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
-
-        if ((b_start <= a_start && a_start < b_end) || (a_start <= b_start && b_start < a_end)) {
-            return true;
-        }
-
-        return false;
-    };
-
-    bool is_ok = true;
-    // exception for topk-moe, as each row is read entirely before writing
-    if (ggml_nrows(cgraph->nodes[node_idx]) == 1 && is_topk_moe) {
-        return true;
-    }
-
-    for (int i = 0; i < out_count; ++i) {
-        const ggml_tensor * dst = cgraph->nodes[out_nodes[i]];
-
-        for (int j = node_idx; j < node_idx + node_count; ++j) {
-            // loop over all srcs of all nodes in the fusion. If the src overlaps the destination and
-            // the src is not an intermediate node that's being elided, then disable fusion.
-            for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
-                const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
-
-                if (!src || src->op == GGML_OP_NONE) {
-                    continue;
-                }
-
-                if (nodes_overlap(dst, src)) {
-                    bool found = false;
-
-                    for (int k = node_idx; k < j; ++k) {
-                        if (cgraph->nodes[k] == src) {
-                            found = true;
-                            break;
-                        }
-                    }
-
-                    if (!found) {
-                        is_ok = false;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    return is_ok;
 }
 
 int ggml_sycl_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {

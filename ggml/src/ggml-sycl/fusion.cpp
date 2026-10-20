@@ -3,6 +3,69 @@
 
 #include <algorithm>
 
+// ggml_backend_buffer is only complete in the impl header (the memory-range helper below
+// inspects tensor->buffer directly, like its CUDA original)
+#include "ggml-backend-impl.h"
+
+// ported from ggml_cuda_check_fusion_memory_ranges - pure pointer/range inspection
+bool ggml_sycl_check_fusion_memory_ranges(const ggml_cgraph * cgraph, const int node_idx,
+                                          const int node_count, const int * out_nodes, const int out_count,
+                                          const bool is_topk_moe) {
+    auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        const int64_t a_start = (int64_t) a->data;
+        const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+
+        const int64_t b_start = (int64_t) b->data;
+        const int64_t b_end   = b_start + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+
+        if ((b_start <= a_start && a_start < b_end) || (a_start <= b_start && b_start < a_end)) {
+            return true;
+        }
+
+        return false;
+    };
+
+    bool is_ok = true;
+    // exception for topk-moe, as each row is read entirely before writing
+    if (ggml_nrows(cgraph->nodes[node_idx]) == 1 && is_topk_moe) {
+        return true;
+    }
+
+    for (int i = 0; i < out_count; ++i) {
+        const ggml_tensor * dst = cgraph->nodes[out_nodes[i]];
+
+        for (int j = node_idx; j < node_idx + node_count; ++j) {
+            // loop over all srcs of all nodes in the fusion. If the src overlaps the destination and
+            // the src is not an intermediate node that's being elided, then disable fusion.
+            for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+                const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
+
+                if (!src || src->op == GGML_OP_NONE) {
+                    continue;
+                }
+
+                if (nodes_overlap(dst, src)) {
+                    bool found = false;
+
+                    for (int k = node_idx; k < j; ++k) {
+                        if (cgraph->nodes[k] == src) {
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if (!found) {
+                        is_ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    return is_ok;
+}
+
 // mul_mat(gate) + mul_mat(up) + GLU: graph shape and tensor properties only. Backend state
 // (weight layout, split buffers, DMMV) is checked by ggml_sycl_op_mul_mat_glu_fused().
 static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const ggml_tensor * up,
@@ -111,6 +174,31 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         }
 
         return ggml_sycl_should_fuse_mul_mat_glu(gate, up, glu);
+    }
+
+    // scale_out*sigmoid(scale_in*post) as the hc_post weights (qwen4exp hc_combine); port of the
+    // CUDA (#30602) / Vulkan (#29520) hc_post_gate fusion. The gate feeds hc_post->src[2], so the
+    // generic ggml_can_fuse() chain check below cannot express it — subgraph + explicit edges.
+    if (ops.size() == 4 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY &&
+        ops.begin()[2] == GGML_OP_SCALE && ops.begin()[3] == GGML_OP_DSV4_HC_POST) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 })) {
+            return false;
+        }
+
+        const ggml_tensor * scale_in  = cgraph->nodes[node_idx];
+        const ggml_tensor * sigmoid   = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * scale_out = cgraph->nodes[node_idx + 2];
+
+        // the chain must feed hc_post->src[2]; a bias on either scale is not handled
+        if (ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 2, 2}}) &&
+            ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
+            ggml_get_op_params_f32(scale_in,  1) == 0.0f && ggml_get_op_params_f32(scale_out, 1) == 0.0f &&
+            scale_in->src[0]->type == GGML_TYPE_F32 && scale_out->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(scale_in->src[0], scale_out)) {
+            int out_nodes[] = { node_idx + 3 };
+            return ggml_sycl_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
+        }
+        return false;
     }
 
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {

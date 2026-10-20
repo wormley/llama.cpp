@@ -14,4 +14,8 @@
 bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
                         std::initializer_list<enum ggml_unary_op> unary_ops);
 
+// ported from ggml_cuda_check_fusion_memory_ranges - pure pointer/range inspection
+bool ggml_sycl_check_fusion_memory_ranges(const ggml_cgraph * cgraph, int node_idx, int node_count,
+                                          const int * out_nodes, int out_count, bool is_topk_moe = false);
+
 #endif  // GGML_SYCL_FUSION_HPP

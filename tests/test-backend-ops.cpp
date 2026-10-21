@@ -4488,6 +4488,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_tokens;
     const bool    identity;
     const bool    gated;
+    const bool    affine;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4495,14 +4496,16 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, identity, gated);
+        return VARS_TO_STR5(n_embd, n_tokens, identity, gated, affine);
     }
 
-    // gated: post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain
-    bool run_whole_graph() override { return gated; }
+    // gated:  post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain
+    // affine: post = 2*sigmoid(mixes*scale + base), as glm5-next/deepseek4 build it
+    bool run_whole_graph() override { return gated || affine; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated) {}
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false,
+                      bool affine = false)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), affine(affine) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -4511,11 +4514,26 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
         ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
         ggml_set_name(residual, "residual");
 
-        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
-        ggml_set_name(post, "post");
+        ggml_tensor * post = nullptr;
+        if (affine) {
+            ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            ggml_set_name(mixes, "mixes");
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_set_name(scale, "scale");
+            ggml_tensor * base  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc);
+            ggml_set_name(base, "base");
 
-        if (gated) {
-            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+            post = ggml_mul(ctx, mixes, scale);
+            post = ggml_add(ctx, post, base);
+            post = ggml_sigmoid(ctx, post);
+            post = ggml_scale(ctx, post, 2.0f);
+        } else {
+            post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            ggml_set_name(post, "post");
+
+            if (gated) {
+                post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+            }
         }
 
         ggml_tensor * comb = nullptr;
@@ -9783,6 +9801,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, false, true));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

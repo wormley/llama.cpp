@@ -201,6 +201,39 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         return false;
     }
 
+    // 2*sigmoid(mixes*scale_post + base_post) as the hc_post weights (glm5-next/deepseek4 hc
+    // gate): like the qwen4exp form above, the gate feeds hc_post->src[2], so this branch must
+    // also stay above the generic ggml_can_fuse() call. The whole affine + sigmoid + scale chain
+    // folds into the hc_post kernel.
+    if (ops.size() == 5 && ops.begin()[0] == GGML_OP_MUL && ops.begin()[1] == GGML_OP_ADD &&
+        ops.begin()[2] == GGML_OP_UNARY && ops.begin()[3] == GGML_OP_SCALE &&
+        ops.begin()[4] == GGML_OP_DSV4_HC_POST) {
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 4 })) {
+            return false;
+        }
+
+        const ggml_tensor * mul       = cgraph->nodes[node_idx];
+        const ggml_tensor * add       = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * sigmoid   = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * scale_out = cgraph->nodes[node_idx + 3];
+
+        // the kernel reads the multiplier as a scalar and the bias as a per-stream [ne0] vector,
+        // both contiguous device tensors; a bias on the final scale is not handled
+        if (ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 2, 3}}) &&
+            ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
+            ggml_get_op_params_f32(scale_out, 1) == 0.0f &&
+            mul->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(mul->src[0]) &&
+            mul->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(mul->src[1]) &&
+            ggml_nelements(mul->src[1]) == 1 &&
+            add->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(add->src[1]) &&
+            add->src[1]->ne[0] == mul->src[0]->ne[0] &&
+            scale_out->type == GGML_TYPE_F32 && ggml_are_same_shape(mul->src[0], scale_out)) {
+            int out_nodes[] = { node_idx + 4 };
+            return ggml_sycl_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), out_nodes, 1);
+        }
+        return false;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }

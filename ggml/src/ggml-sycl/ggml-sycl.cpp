@@ -6637,6 +6637,18 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        // 2*sigmoid(mixes*scale_post + base_post) as the hc_post weights (glm5-next/deepseek4 hc
+        // gate); the affine, sigmoid and scale nodes are elided and the hc_post kernel applies
+        // the whole gate itself
+        if (node->op == GGML_OP_MUL &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST },
+                               { GGML_UNARY_OP_SIGMOID })) {
+            ggml_sycl_op_dsv4_hc_post(*sycl_ctx, cgraph->nodes[i + 4], node, cgraph->nodes[i + 3],
+                                      cgraph->nodes[i + 1]->src[1]);
+            i += 4;
+            continue;
+        }
+
         // Batch consecutive independent same-shape F32 L2_NORM siblings (the GDN q/k
         // norms) into one launch; sources are strided views of the fused qkv buffer, so
         // the scan skips the interleaved view nodes instead of breaking on them.

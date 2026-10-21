@@ -157,8 +157,12 @@ static constexpr int dsv4_hc_post_block_size = 256;
 
 // comb == nullptr is identity mixing: each destination stream keeps its own residual
 // instead of summing across the streams.
-// gated: post = gate_scale_out*sigmoid(gate_scale_in*post), the fused SCALE -> SIGMOID -> SCALE chain of qwen4exp
-template <bool has_comb, bool gated>
+// gated folds the post-weight gate into the kernel:
+//   scalar (qwen4exp):             post = gate_scale_out*sigmoid(gate_scale_in*p)
+//   affine (glm5-next/deepseek4):  post = gate_scale_out*sigmoid(gate_scale_ptr[0]*p + gate_base_ptr[idst])
+// where p is the raw pre-gate weight; in the affine form the scale and bias are device tensors
+// (per-layer weights), in the scalar form the scale comes from the leading SCALE node's params.
+template <bool has_comb, bool gated, bool affine = false>
 static void dsv4_hc_post_f32_sycl(
         const float * x, const float * residual, const float * post, const float * comb, float * dst,
         int64_t n_embd, int64_t hc, int64_t n_tokens,
@@ -169,6 +173,8 @@ static void dsv4_hc_post_f32_sycl(
         int64_t sd0, int64_t sd1, int64_t sd2,
         float gate_scale_in,
         float gate_scale_out,
+        const float * gate_scale_ptr,
+        const float * gate_base_ptr,
         queue_ptr stream) {
     const int64_t nr = n_embd * hc * n_tokens;
     const int64_t block_size = dsv4_hc_post_block_size;
@@ -188,9 +194,16 @@ static void dsv4_hc_post_f32_sycl(
 
             float p = post[idst*sp0 + it*sp1];
             if constexpr (gated) {
+                float pre;
+                if constexpr (affine) {
+                    // matches the standalone MUL + ADD kernels (binbcast f32)
+                    pre = gate_scale_ptr[0] * p + gate_base_ptr[idst];
+                } else {
+                    pre = gate_scale_in * p;
+                }
                 // same expression as the standalone SIGMOID + SCALE kernels (op_sigmoid + scale_f32),
                 // so the fused gate is numerically identical to the unfused chain
-                p = gate_scale_out * (1.0f / (1.0f + sycl::exp(-(gate_scale_in * p))));
+                p = gate_scale_out * (1.0f / (1.0f + sycl::exp(-pre)));
             }
 
             float sum = x[i0*sx0 + it*sx1] * p;
@@ -295,18 +308,31 @@ void ggml_sycl_op_dsv4_hc_comb(ggml_backend_sycl_context & ctx, ggml_tensor * ds
 }
 
 void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
-        const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out) {
+        const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out,
+        const ggml_tensor * gate_bias) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
     const ggml_tensor * comb     = dst->src[3];
 
-    // when fused, read the raw post weights from before the SCALE -> SIGMOID -> SCALE chain
-    const bool          gated = gate_scale_in != nullptr;
-    const ggml_tensor * post  = gated ? gate_scale_in->src[0] : dst->src[2];
+    // fused gate forms, selected by the leading node of the chain feeding src[2]:
+    // - GGML_OP_SCALE: scalar gate, the SCALE -> SIGMOID -> SCALE chain of qwen4exp
+    // - GGML_OP_MUL:   affine gate, mul(scale) + add(bias) + sigmoid + scale of glm5-next/deepseek4
+    // when fused, read the raw post weights from before the gate chain
+    const bool  gated  = gate_scale_in != nullptr;
+    const bool  affine = gated && gate_scale_in->op == GGML_OP_MUL;
+    GGML_ASSERT(!gated || gate_scale_in->op == GGML_OP_SCALE || affine);
+    GGML_ASSERT(!affine || gate_bias != nullptr);
+    GGML_ASSERT(!affine || (gate_scale_in->src[1]->type == GGML_TYPE_F32 &&
+                ggml_nelements(gate_scale_in->src[1]) == 1 && ggml_is_contiguous(gate_scale_in->src[1])));
+    GGML_ASSERT(!affine || (gate_bias->type == GGML_TYPE_F32 && ggml_is_contiguous(gate_bias)));
+    const ggml_tensor * post = gated ? gate_scale_in->src[0] : dst->src[2];
 
-    const float gate_in  = gated ? ggml_get_op_params_f32(gate_scale_in,  0) : 1.0f;
+    const float gate_in  = (!gated || affine) ? 1.0f : ggml_get_op_params_f32(gate_scale_in, 0);
     const float gate_out = gated ? ggml_get_op_params_f32(gate_scale_out, 0) : 1.0f;
+
+    const float * gate_scale_ptr = affine ? (const float *) gate_scale_in->src[1]->data : nullptr;
+    const float * gate_base_ptr  = affine ? (const float *) gate_bias->data : nullptr;
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
@@ -334,8 +360,8 @@ void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * ds
 
     queue_ptr stream = ctx.stream();
 
-    const auto launch = [&](auto has_comb, auto gated_v) {
-        dsv4_hc_post_f32_sycl<decltype(has_comb)::value, decltype(gated_v)::value>(
+    const auto launch = [&](auto has_comb, auto gated_v, auto affine_v) {
+        dsv4_hc_post_f32_sycl<decltype(has_comb)::value, decltype(gated_v)::value, decltype(affine_v)::value>(
             (const float *) x->data, (const float *) residual->data,
             (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
             n_embd, hc, n_tokens,
@@ -344,21 +370,24 @@ void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
-            gate_in, gate_out,
-            stream);
+            gate_in, gate_out, gate_scale_ptr, gate_base_ptr, stream);
     };
 
     if (comb) {
-        if (gated) {
-            launch(std::true_type{}, std::true_type{});
+        if (!gated) {
+            launch(std::true_type{}, std::false_type{}, std::false_type{});
+        } else if (!affine) {
+            launch(std::true_type{}, std::true_type{}, std::false_type{});
         } else {
-            launch(std::true_type{}, std::false_type{});
+            launch(std::true_type{}, std::true_type{}, std::true_type{});
         }
     } else {
-        if (gated) {
-            launch(std::false_type{}, std::true_type{});
+        if (!gated) {
+            launch(std::false_type{}, std::false_type{}, std::false_type{});
+        } else if (!affine) {
+            launch(std::false_type{}, std::true_type{}, std::false_type{});
         } else {
-            launch(std::false_type{}, std::false_type{});
+            launch(std::false_type{}, std::true_type{}, std::true_type{});
         }
     }
 }

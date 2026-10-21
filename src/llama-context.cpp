@@ -625,13 +625,32 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
-            if (device_fused != device_layer) {
+            // Only disable for the "missing support on the layer's device" signature: the node was
+            // pushed down to CPU while the layer lives on a GPU. The scheduler's flow-based
+            // placement in the other direction — a boundary layer's fused op landing on the
+            // neighbouring device next to the larger sibling-side activations — is normal and
+            // correct: it copies what it needs, exactly as the decomposed op sequence would, so
+            // it must not kill the fused op. (It previously disabled the fused DeepSeek V4 HC
+            // post path for every layer on hybrid splits, e.g. GLM-5.3-Flash at ngl 24 where
+            // layers 0-22 are CPU: the boundary layer's hc_post legitimately flowed to SYCL0.)
+            const bool node_on_cpu  = device_fused == nullptr ||
+                ggml_backend_dev_type(device_fused) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            const bool layer_on_cpu = device_layer == nullptr ||
+                ggml_backend_dev_type(device_layer) == GGML_BACKEND_DEVICE_TYPE_CPU;
+
+            if (node_on_cpu && !layer_on_cpu) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",
                         func, node.il,
                         device_layer ? ggml_backend_dev_name(device_layer) : "none",
                         probe.name,
                         device_fused ? ggml_backend_dev_name(device_fused) : "none");
+                for (int s = 0; s < GGML_MAX_SRC && node.tensor->src[s] != nullptr; ++s) {
+                    ggml_backend_t backend_src = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor->src[s]);
+                    LLAMA_LOG_DEBUG("%s:   %s src[%d] = %s (%s)\n", func, probe.name, s,
+                            node.tensor->src[s]->name,
+                            backend_src ? ggml_backend_dev_name(ggml_backend_get_device(backend_src)) : "none");
+                }
                 device_mismatch = true;
                 break;
             }

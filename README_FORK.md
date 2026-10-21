@@ -91,6 +91,10 @@ cache).
 | `e4b5dfb2c` | qwen4exp: build MTP QSA pool inputs only when the MTP layer uses QSA | fixes upstream [#29811](https://github.com/ggml-org/llama.cpp/issues/29811) (server init abort with draft-mtp) |
 | `39725fcd8` | sycl: lightning-indexer skip pool-mask-dropped rows | exact-preserving (−inf + finite = −inf); +9 % short prefill |
 | `d2fc93cf2` → `13caeaf6b` | sycl: gate grouped MoE dequant-GEMM on routed-row count (`GGML_SYCL_GROUPED_MAX_ROWS`, default 512; reorder install inside the gate) | recovers the prefill regression from upstream's grouped-XMX path (#29245) while keeping its decode win: decode/MTP-verify batches pass the gate, 5120-row prefill ubatches use the library GEMM |
+| `6acd051d3` | sycl: fuse the qwen4exp hc_post gate (SCALE→SIGMOID→SCALE) into the hc_post kernel | port of upstream #30602 CUDA / #29520 Vulkan; branch + guards live in `ggml-sycl/fusion.cpp` before the generic `ggml_can_fuse()` call (the gate feeds `hc_post->src[2]`) |
+| `f9127dea0` | sycl: fold the affine hc_post gate of glm5-next/deepseek4 (MUL→ADD→SIGMOID→SCALE) into the hc_post kernel | fork-original extension of the same precedent — covers GLM-5.3-Flash and DeepSeek-V4/dflash; 5 kernels → 1 per chain; bitwise-exact via `#pragma clang fp contract(off)` (see `578a44452`) |
+| `863c6b33a` | llama-context: don't disable fused ops on hybrid-split boundary flow | the fused-op probe killed the fused hc_post path for ALL layers on hybrid splits (GLM ngl 24: "layer 22 is CPU but fused HC post is SYCL0"); only the real missing-support signature (node pushed down to CPU off a GPU layer) disables now — without this neither fusion can ever fire on this rig |
+| `578a44452` | sycl: keep the affine hc_post gate bitwise identical to the unfused chain | FMA contraction broke two-rounding mul+add; verified: unfused-vs-unfused arms across boots also diverge at long context (atomics nondeterminism), so model-level A/B is timing-based |
 
 Inherited from upstream (already merged, required): GLM-5.3-Flash support
 [#27773](https://github.com/ggml-org/llama.cpp/pull/27773), sparse-attention gather
@@ -99,6 +103,51 @@ removal [#30042](https://github.com/ggml-org/llama.cpp/pull/30042).
 Rejected after A/B (kept only on branch `glm-next`): [#30606](https://github.com/ggml-org/llama.cpp/pull/30606)
 (BMG D=256 FA vector-kernel decode routing) — −11 % GLM decode @2k, neutral @32k;
 helps dense GQA D=256 models, not absorbed-MLA sparse attention.
+
+## Fusion validation & benchmarks (2026-10-21, Apollo)
+
+Image `registry.wormley.com/ai/llama.cpp-intel:hc-post-fusion` (id `fada1ff179f8a`,
+built on the build host, pulled to Apollo — no builds on the GPU host). Scripts:
+`scripts/apollo-hcpost/`. Evidence: `/home/llm/hcpost-tests/` (per-arm container logs,
+dmesg, client dumps); GPQA per-question dumps in `gpqa-*/outputs/`.
+
+**Unit validation** (`test-backend-ops -b SYCL0 -o 'DSV4_HC.*'`, fusion on AND off): all
+12 DSV4_HC_POST variants pass vs the CPU reference on the B70, incl. the new
+gated (qwen4exp) and affine (GLM) whole-graph cases; TOPK_MOE regression clean.
+**Fusion-fires evidence** (GLM boot + 1 request, `GGML_SYCL_DEBUG=1` dispatch
+counts, fusion on vs off): −318 `ggml_sycl_mul`, −452 `ggml_sycl_add`, −88
+`ggml_sycl_scale`, −30 `ggml_sycl_sigmoid` dispatches, hc_post calls preserved —
+the affine fold elides the whole gate chain. Note: without `863c6b33a` the probe
+showed `fused DeepSeek V4 HC post not supported, set to disabled` and none of this
+engaged on the hybrid split.
+
+**A/B timing** (same image, `GGML_SYCL_ENABLE_FUSION` 1 vs 0, validated recipes,
+server-side slot timing, decodes fixed at 256 tokens via ignore_eos, 2k ctx):
+
+| model | arm | decode d1 (cold) | decode d2 (warm) | decode d3 (warm) | prefill 4k | prefill 16k |
+|---|---|---|---|---|---|---|
+| GLM UD-Q4_K_XL ngl 24 | fusion on | 5.2 | 6.0 | 5.0 | 125.7 | (pB run) |
+| GLM UD-Q4_K_XL ngl 24 | fusion off | 5.3 | 6.0 | 5.4 | 128.5 | (pB run) |
+| qwen Q8_0 ngl 30 | fusion on | 10.9 | 13.1 | 13.2 | 243.9 | 267.6 |
+| qwen Q8_0 ngl 30 | fusion off | 9.0 | 11.9 | 15.0 | 202.5 | 249.3 |
+
+(tok/s; single boot per arm, 3 decodes + 2 prefills each; long-context outputs are
+NOT bit-reproducible run-to-run on this rig even unfused — atomics nondeterminism
+— so arms are compared on timing, with needle/arith gates passing in every arm.)
+
+**Honest read:** the per-token launch savings (~184–370 launches/token) are real and
+verified at the dispatch level, but on this host decode is dominated by the CPU-
+resident half of the model, so the expected ~1–3 % decode effect is inside the
+run-to-run noise band (±10 % between boots; note qwen f0 d3 hit 15.0). No regression
+in any arm; the fusions are structural wins for GPU-heavy splits and fully-offloaded
+ rigs. Prefill unchanged (GEMM-bound), as predicted.
+
+**GPQA-Diamond** (198 q, temperature 0, thinking off / effort low, fixed option
+order, same prompt set for all models — full methodology, rankings and caveats in
+`/root/code/GPQA_RANKINGS.md`; runner `scripts/apollo-hcpost/gpqa_client.py`):
+GLM-5.3-Flash **73.2 %**, qwen UD-Q6_K_XL 52.0 %, qwen Q8_0 51.0 % — GLM leads by
++21 pts (≫ 1 σ ≈ 3.6 pts); the qwen pair is a statistical tie (with thinking
+disabled; GLM used ~2× the generation tokens at effort "low").
 
 ## Open items / recommended next steps
 

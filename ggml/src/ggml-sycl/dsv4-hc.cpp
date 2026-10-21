@@ -162,6 +162,10 @@ static constexpr int dsv4_hc_post_block_size = 256;
 //   affine (glm5-next/deepseek4):  post = gate_scale_out*sigmoid(gate_scale_ptr[0]*p + gate_base_ptr[idst])
 // where p is the raw pre-gate weight; in the affine form the scale and bias are device tensors
 // (per-layer weights), in the scalar form the scale comes from the leading SCALE node's params.
+// The affine pre-activation must stay two separately-rounded ops (mul, then add) to remain
+// bitwise identical to the unfused MUL + ADD kernel pair — disable FMA contraction for the
+// kernel, then restore.
+#pragma clang fp contract(off)
 template <bool has_comb, bool gated, bool affine = false>
 static void dsv4_hc_post_f32_sycl(
         const float * x, const float * residual, const float * post, const float * comb, float * dst,
@@ -306,6 +310,8 @@ void ggml_sycl_op_dsv4_hc_comb(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
             eps, n_iter, stream);
 }
+
+#pragma clang fp contract(on)
 
 void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
         const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out,

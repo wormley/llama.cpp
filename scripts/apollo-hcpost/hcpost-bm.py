@@ -53,11 +53,13 @@ def sized(nonce, target, question=NEEDLE_Q):
     code = "AZ" + nonce
     return build(lo, code, nonce, question), count(build(lo, code, nonce, question)), code
 
-def chat(msg, mx, name, timeout=7200):
+def chat(msg, mx, name, timeout=7200, ignore_eos=False):
     payload = {"model": alias, "messages": [{"role": "user", "content": msg}],
                "temperature": 0, "max_tokens": mx, "stream": True,
                "stream_options": {"include_usage": True},
                "chat_template_kwargs": KWT}
+    if ignore_eos:
+        payload["ignore_eos"] = True
     t0 = time.time(); first = None; text = ""; ptok = 0; ntok = 0
     try:
         r = req(payload, timeout)
@@ -91,12 +93,13 @@ def chat(msg, mx, name, timeout=7200):
 _, _, r = chat("Compute 17*23. Reply with only the number.", 512, "arith")
 print("%s ARITH %s" % (tag, "OK" if r and "391" in r else "FAIL"), flush=True)
 
-# 2. decode: 3 x ~384-token generations at ~2k ctx, needle in every prompt
-# (max_tokens high enough for reasoning models to finish; deterministic tail
-# keeps the generation length usable for timing)
+# 2. decode: 3 x 256-token FIXED-LENGTH generations at ~2k ctx, needle in every
+# prompt. ignore_eos pins the generation length so tok/s is comparable across
+# arms (long-context outputs are not bit-reproducible run-to-run on this rig
+# even unfused — atomics nondeterminism — so we time, not diff).
 for i, nonce in enumerate(("d1", "d2", "d3"), 1):
     msg, ptok, code = sized(nonce, 2048)
-    _, _, r = chat(msg, 384, "decode-" + nonce)
+    _, _, r = chat(msg, 256, "decode-" + nonce, ignore_eos=True)
     ok = r is not None and code in r
     print("%s DECODE-%d %s ctx=%d needle=%s" % (tag, i, "OK" if r else "EXC", ptok,
           "PASS" if ok else "FAIL"), flush=True)
